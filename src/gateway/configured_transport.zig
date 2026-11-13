@@ -161,7 +161,17 @@ fn post(
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
-    const extra = try std.mem.concat(alloc, std.http.Header, &.{ &.{.{ .name = "accept", .value = "text/event-stream" }}, headers.list });
+    // A conversation's session ID travels under the connection's own header,
+    // so the server can route the conversation and reuse its prompt cache.
+    // A request with no session (such as a one-shot turn fx does not save)
+    // sends none.
+    var session_header: []const std.http.Header = &.{};
+    if (definition.session_header) |name| {
+        if (request.session_id) |session_id| {
+            if (session_id.len > 0) session_header = &.{.{ .name = name, .value = session_id }};
+        }
+    }
+    const extra = try std.mem.concat(alloc, std.http.Header, &.{ &.{.{ .name = "accept", .value = "text/event-stream" }}, headers.list, session_header });
     defer alloc.free(extra);
     try request.admission.admit();
     const timeouts = definition.timeouts;

@@ -192,6 +192,31 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("a connection sends the conversation's session ID in its own header", async () => {
+    const f = fixture(body => completion(body.model, "session header reply"));
+    try {
+      (f.settings.providers.local as any).session_header = "x-opencode-session";
+      f.save();
+      const first = await runFx(["ask", "--json", "Remember this conversation"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      expect(saved.session_id.length).toBeGreaterThan(0);
+      expect(f.requests[0].headers["x-opencode-session"]).toBe(saved.session_id);
+      // A generic HTTP library's user agent is not enough; fx names itself.
+      expect(f.requests[0].headers["user-agent"]).toStartWith("fx/");
+
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "Continue"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests[1].headers["x-opencode-session"]).toBe(saved.session_id);
+
+      // A turn fx does not save has no session to route.
+      const noSave = await runFx(["ask", "--json", "--no-save", "One-shot turn"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (noSave.code !== 0) throw new Error(noSave.stdout + noSave.stderr);
+      expect(JSON.parse(noSave.stdout).session_id).toBe("");
+      expect(f.requests[2].headers["x-opencode-session"]).toBeUndefined();
+    } finally { f.close(); }
+  }, 30000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);
