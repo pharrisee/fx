@@ -148,6 +148,10 @@ pub const Definition = struct {
     /// the connection has no image fallback.
     vision_model: ?[]const u8 = null,
     headers: []const Header = &.{},
+    /// A header that carries the conversation's session ID on every model
+    /// request, so a server can route the conversation and reuse its prompt
+    /// cache. Null sends none. A model list request carries no session.
+    session_header: ?[]const u8 = null,
     timeouts: Timeouts = .{},
     /// Ask the server for its model list (`GET {base_url}/models`). Off unless
     /// the settings turn it on, so fx never probes a server on its own
@@ -400,7 +404,7 @@ pub const Registry = struct {
 /// `owned` is the registry's arena: a failure frees nothing here.
 fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "session_header", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
     enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
@@ -432,6 +436,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
     const title_model = try optional_model(owned, value, "title_model", at);
     const vision_model = try optional_model(owned, value, "vision_model", at);
     const headers = if (value.object.get("headers")) |headers| try parse_headers(owned, headers, at) else &.{};
+    const session_header = try parse_session_header(owned, protocol, value, headers, at);
     const timeouts = if (value.object.get("timeouts")) |timeouts| try parse_timeouts(timeouts, at) else Timeouts{};
     var model_defaults: ?ModelMetadata = null;
     if (value.object.get("model_defaults")) |defaults| {
@@ -453,6 +458,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .title_model = title_model,
         .vision_model = vision_model,
         .headers = headers,
+        .session_header = session_header,
         .timeouts = timeouts,
         .fetch_models = fetch_models,
         .model_defaults = model_defaults,
@@ -500,6 +506,34 @@ fn environment_name(value: std.json.Value) ParseError![]const u8 {
 /// how a connection sets Authorization.
 const reserved_headers = [_][]const u8{ "authorization", "content-type", "content-length", "host", "accept", "accept-encoding", "user-agent", "connection", "transfer-encoding" };
 
+/// A header name fx may set from a setting: bounded, token characters only,
+/// and none that fx or the transport owns.
+fn validate_header_name(name: []const u8) ParseError!void {
+    if (name.len > max_header_name_bytes) return error.LimitExceeded;
+    if (name.len == 0) return error.InvalidHeaderName;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeaderName;
+    }
+    for (reserved_headers) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedHeader;
+    }
+}
+
+/// The header that carries the session ID. It cannot repeat a header the
+/// connection already sets, nor the version header its protocol adds.
+fn parse_session_header(owned: Allocator, protocol: Protocol, value: std.json.Value, headers: []const Header, at: ?*FailurePath) ParseError!?[]const u8 {
+    const present = value.object.get("session_header") orelse return null;
+    enter(at, "session_header");
+    defer leave(at);
+    if (present != .string) return error.InvalidHeaderName;
+    try validate_header_name(present.string);
+    if (protocol == .@"anthropic-messages" and std.ascii.eqlIgnoreCase(present.string, "anthropic-version")) return error.ReservedHeader;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, present.string)) return error.DuplicateField;
+    }
+    return try owned.dupe(u8, present.string);
+}
+
 fn parse_headers(owned: Allocator, value: std.json.Value, at: ?*FailurePath) ParseError![]const Header {
     enter(at, "headers");
     if (value != .object) return error.InvalidObject;
@@ -510,14 +544,7 @@ fn parse_headers(owned: Allocator, value: std.json.Value, at: ?*FailurePath) Par
     while (iterator.next()) |entry| : (index += 1) {
         const name = entry.key_ptr.*;
         enter(at, name);
-        if (name.len > max_header_name_bytes) return error.LimitExceeded;
-        if (name.len == 0) return error.InvalidHeaderName;
-        for (name) |byte| {
-            if (!std.ascii.isAlphanumeric(byte) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", byte) == null) return error.InvalidHeaderName;
-        }
-        for (reserved_headers) |reserved| {
-            if (std.ascii.eqlIgnoreCase(name, reserved)) return error.ReservedHeader;
-        }
+        try validate_header_name(name);
         // Header names are case-insensitive, so two spellings are one header.
         for (headers[0..index]) |earlier| {
             if (std.ascii.eqlIgnoreCase(earlier.name, name)) return error.DuplicateField;
@@ -1047,7 +1074,7 @@ test "configured provider validation failures release earlier definitions and mo
 const test_options_json =
     \\{"router":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"bearer","env":"ROUTER_KEY"},
     \\"title_model":"small/title","vision_model":"small/vision","fetch_models":true,
-    \\"headers":{"X-Org":{"env":"ROUTER_ORG"},"x-trace":{"env":"_TRACE"}},
+    \\"headers":{"X-Org":{"env":"ROUTER_ORG"},"x-trace":{"env":"_TRACE"}},"session_header":"x-opencode-session",
     \\"timeouts":{"connect_ms":1,"first_response_ms":600000,"stall_ms":86400000},
     \\"model_defaults":{"context_window":65536,"supports_tool_use":true,"request":{"top_p":0.9},"reasoning_efforts":{"low":{"reasoning_effort":"low"}}},
     \\"model_metadata":{
@@ -1067,6 +1094,7 @@ test "configured provider reads connection options, request fields, and effort l
     try std.testing.expectEqualStrings("X-Org", router.headers[0].name);
     try std.testing.expectEqualStrings("ROUTER_ORG", router.headers[0].env);
     try std.testing.expectEqualStrings("_TRACE", router.headers[1].env);
+    try std.testing.expectEqualStrings("x-opencode-session", router.session_header.?);
     try std.testing.expectEqual(Timeouts{ .connect_ms = 1, .first_response_ms = 600_000, .stall_ms = max_timeout_ms }, router.timeouts);
 
     const thinker = router.model("thinker").?;
@@ -1184,6 +1212,12 @@ test "configured provider refuses fx's own fields and headers, and malformed opt
         .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId, .path = "local.title_model" },
         .{ .json = "\"vision_model\":7", .err = error.InvalidModelId, .path = "local.vision_model" },
         .{ .json = "\"tool_choice_mode\":\"always\"", .err = error.InvalidToolChoiceMode, .path = "local.tool_choice_mode" },
+        .{ .json = "\"session_header\":\"X Session\"", .err = error.InvalidHeaderName, .path = "local.session_header" },
+        .{ .json = "\"session_header\":\"\"", .err = error.InvalidHeaderName, .path = "local.session_header" },
+        .{ .json = "\"session_header\":7", .err = error.InvalidHeaderName, .path = "local.session_header" },
+        .{ .json = "\"session_header\":\"User-Agent\"", .err = error.ReservedHeader, .path = "local.session_header" },
+        .{ .json = "\"headers\":{\"X-Org\":{\"env\":\"A\"}},\"session_header\":\"x-org\"", .err = error.DuplicateField, .path = "local.session_header" },
+        .{ .json = "\"session_header\":\"" ++ text_utils.repeat("h", max_header_name_bytes + 1) ++ "\"", .err = error.LimitExceeded, .path = "local.session_header" },
         .{ .json = "\"bogus\":1", .err = error.UnknownField, .path = "local.bogus" },
     };
     for (cases) |case| {
@@ -1227,6 +1261,15 @@ test "configured provider refuses fx's own fields and headers, and malformed opt
             registry.deinit(std.testing.allocator);
         }
     }
+}
+
+test "a configured provider cannot name the version header its protocol adds" {
+    const alloc = std.testing.allocator;
+    const anthropic = "{\"c\":{\"protocol\":\"anthropic-messages\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"none\"},\"session_header\":\"Anthropic-Version\"}}";
+    try std.testing.expectError(error.ReservedHeader, Registry.parse_json(alloc, anthropic));
+    const chat = "{\"c\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com\",\"auth\":{\"type\":\"none\"},\"session_header\":\"anthropic-version\"}}";
+    var registry = try Registry.parse_json(alloc, chat);
+    registry.deinit(alloc);
 }
 
 test "configured provider takes sixteen effort levels and sixteen headers, and one more of neither" {
